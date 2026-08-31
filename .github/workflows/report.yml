@@ -1,0 +1,65 @@
+name: Report
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Generate job summary
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.generate.outputs.status }}
+      passed: ${{ steps.generate.outputs.passed }}
+      failed: ${{ steps.generate.outputs.failed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The report writes itself to $GITHUB_STEP_SUMMARY, plus report.md and
+      # report-result.json on disk, plus status/passed/failed step outputs.
+      - name: Generate report
+        id: generate
+        run: python -m src.report
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-report
+          path: |
+            report.md
+            report-result.json
+          if-no-files-found: error
+
+  consume:
+    name: Consume result
+    runs-on: ubuntu-latest
+    needs: report
+    steps:
+      # Demonstrates that the same run is available as structured data to
+      # downstream jobs, not just as rendered Markdown.
+      - name: Echo upstream result
+        env:
+          STATUS: ${{ needs.report.outputs.status }}
+          PASSED: ${{ needs.report.outputs.passed }}
+          FAILED: ${{ needs.report.outputs.failed }}
+        run: |
+          {
+            echo "## Downstream job"
+            echo
+            echo "| Field | Value |"
+            echo "| :--- | ---: |"
+            echo "| status | \`${STATUS}\` |"
+            echo "| passed | ${PASSED} |"
+            echo "| failed | ${FAILED} |"
+          } >> "$GITHUB_STEP_SUMMARY"

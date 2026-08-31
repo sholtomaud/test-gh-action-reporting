@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Generate a rich Markdown report and publish it as a GitHub Actions job summary.
+
+The generator is deliberately split in two halves:
+
+* :func:`collect` gathers structured data (here: a stubbed set of checks plus
+  real environment facts). Swap this out for test results, an AWS inventory,
+  security findings, benchmarks -- anything.
+* :func:`build_report` renders that data into GitHub-flavoured Markdown using
+  :mod:`src.markdown`.
+
+Nothing in here depends on the Actions toolkit. Publishing a job summary is just
+"append UTF-8 Markdown to the file named by $GITHUB_STEP_SUMMARY".
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from . import markdown as md
+
+# GitHub truncates job summaries above 1 MiB.
+SUMMARY_LIMIT_BYTES = 1024 * 1024
+
+STATUS_ICONS = {"pass": "🟢", "fail": "🔴", "warn": "🟡", "skip": "⚪"}
+
+
+@dataclass(frozen=True)
+class Check:
+    """One validation step in the report."""
+
+    name: str
+    status: str
+    detail: str
+    duration_s: float
+
+    @property
+    def icon(self) -> str:
+        return STATUS_ICONS.get(self.status, "⚪")
+
+    @property
+    def label(self) -> str:
+        return f"{self.icon} **{self.status.upper()}**"
+
+
+@dataclass(frozen=True)
+class Component:
+    """A subsystem reported on in the dashboard table."""
+
+    name: str
+    status: str
+    score: float
+    notes: str
+
+
+def collect() -> dict[str, Any]:
+    """Gather the data the report renders.
+
+    Replace the hard-coded checks with a real data source; every consumer below
+    only reads from the returned dict.
+    """
+    checks = [
+        Check("Repository checkout", "pass", "Source tree available", 0.42),
+        Check("Python environment", "pass", f"CPython {platform.python_version()}", 0.18),
+        Check("Static validation", "pass", "No validation errors", 1.27),
+        Check("Renderer self-test", "pass", "All Markdown blocks produced", 0.06),
+        Check("Retention sweep", "warn", "Archive job has not run in 3 days", 0.91),
+    ]
+    components = [
+        Component("Collector", "pass", 0.98, "Within expected range"),
+        Component("Processor", "pass", 0.95, "Stable across 24h window"),
+        Component("Reporter", "pass", 1.00, "Output verified"),
+        Component("Archive", "warn", 0.82, "Awaiting retention job"),
+    ]
+    return {
+        "generated_at": datetime.now(timezone.utc),
+        "checks": checks,
+        "components": components,
+        "environment": {
+            "Python": platform.python_version(),
+            "Implementation": platform.python_implementation(),
+            "Platform": f"{platform.system()} {platform.release()}",
+            "Machine": platform.machine(),
+            "Runner": os.environ.get("RUNNER_OS", "local"),
+            "Workflow": os.environ.get("GITHUB_WORKFLOW", "n/a"),
+            "Run": os.environ.get("GITHUB_RUN_ID", "n/a"),
+            "Commit": (os.environ.get("GITHUB_SHA") or "n/a")[:12],
+        },
+    }
+
+
+def summarise(data: dict[str, Any]) -> dict[str, Any]:
+    """Reduce the collected data to the machine-readable result payload."""
+    checks: list[Check] = data["checks"]
+    counts = {status: sum(c.status == status for c in checks) for status in STATUS_ICONS}
+    overall = "fail" if counts["fail"] else ("warn" if counts["warn"] else "pass")
+    return {
+        "status": overall.upper(),
+        "total": len(checks),
+        "passed": counts["pass"],
+        "failed": counts["fail"],
+        "warnings": counts["warn"],
+        "duration_s": round(sum(c.duration_s for c in checks), 2),
+        "generated_at": data["generated_at"].isoformat(timespec="seconds"),
+    }
+
+
+def build_report(data: dict[str, Any] | None = None) -> str:
+    """Render the full Markdown report."""
+    data = data or collect()
+    checks: list[Check] = data["checks"]
+    components: list[Component] = data["components"]
+    result = summarise(data)
+    now: datetime = data["generated_at"]
+    pass_rate = result["passed"] / result["total"] if result["total"] else 0.0
+    overall_icon = STATUS_ICONS[result["status"].lower()]
+
+    doc = md.Document()
+
+    # -- 1. Title and status strip ----------------------------------------
+    doc.add(
+        md.heading("🚀 Engineering Report"),
+        " ".join(
+            str(b)
+            for b in (
+                md.badge("status", result["status"], "brightgreen" if result["status"] == "PASS" else "orange"),
+                md.badge("checks", f"{result['passed']}/{result['total']}", "blue"),
+                md.badge("python", data["environment"]["Python"], "3776ab"),
+            )
+        ),
+        md.paragraph(
+            f"""{overall_icon} **Overall status: {result["status"]}** — generated by
+            `src/report.py` and published straight to the GitHub Actions job summary."""
+        ),
+        md.rule(),
+    )
+
+    # -- 2. Executive summary ---------------------------------------------
+    doc.add(
+        md.heading("1. Executive summary", 2),
+        md.table(
+            ["Metric", "Value"],
+            [
+                ["Total checks", result["total"]],
+                ["Passed", f"🟢 {result['passed']}"],
+                ["Warnings", f"🟡 {result['warnings']}"],
+                ["Failed", f"🔴 {result['failed']}"],
+                ["Wall time", f"`{result['duration_s']} s`"],
+                ["Pass rate", md.bar(pass_rate)],
+            ],
+            align=["left", "left"],
+        ),
+        md.alert(
+            "NOTE",
+            "This Markdown was produced by Python and appended to the path in\n"
+            "`$GITHUB_STEP_SUMMARY`. GitHub renders it on the run's summary page.",
+        ),
+    )
+
+    # -- 3. Validation results --------------------------------------------
+    doc.add(
+        md.heading("2. Validation results", 2),
+        md.table(
+            ["Check", "Status", "Detail", "Duration"],
+            [[c.name, md.Raw(c.label), c.detail, f"`{c.duration_s:.2f} s`"] for c in checks],
+            align=["left", "center", "left", "right"],
+        ),
+        md.details(
+            "🔍 Environment and execution detail",
+            "\n\n".join(
+                [
+                    md.heading("Environment", 4),
+                    md.key_values(data["environment"], ("Property", "Value")),
+                    md.heading("Interpreter", 4),
+                    md.code_block(f"{sys.executable}\n{sys.version}", "text"),
+                    md.heading("Sequence", 4),
+                    md.ordered_list(
+                        [
+                            "Check out the source",
+                            "Initialise Python",
+                            "Collect structured data",
+                            "Render Markdown",
+                            "Append to `$GITHUB_STEP_SUMMARY`",
+                        ]
+                    ),
+                ]
+            ),
+        ),
+    )
+
+    # -- 4. Every alert type ----------------------------------------------
+    doc.add(
+        md.heading("3. Status callouts", 2),
+        md.alert("NOTE", "Useful information a reader should notice even when skimming."),
+        md.alert("TIP", "`$GITHUB_STEP_SUMMARY` is the simplest way to publish rich Markdown from a step."),
+        md.alert("IMPORTANT", "Write to the path GitHub supplies at runtime; never hard-code it."),
+        md.alert("WARNING", "Summaries are truncated above 1 MiB — the writer below guards for that."),
+        md.alert("CAUTION", "Treat untrusted input as data. Escape it before it reaches a table or inline HTML."),
+    )
+
+    # -- 5. Task list ------------------------------------------------------
+    doc.add(
+        md.heading("4. Delivery checklist", 2),
+        md.task_list(
+            [
+                (True, "Check out repository"),
+                (True, "Configure Python"),
+                (True, "Render Markdown report"),
+                (True, "Publish job summary"),
+                (True, "Upload `report.md` artifact"),
+                (False, "Wire in a real data source"),
+                (False, "Add historical trend analysis"),
+            ]
+        ),
+    )
+
+    # -- 6. Diagrams -------------------------------------------------------
+    doc.add(
+        md.heading("5. Pipeline", 2),
+        md.mermaid(
+            """
+            flowchart LR
+                A[actions/checkout] --> B[setup-python]
+                B --> C["python -m src.report"]
+                C --> D{{"$GITHUB_STEP_SUMMARY"}}
+                C --> E[report.md]
+                C --> F[report-result.json]
+                D --> G([Rendered job summary])
+                E --> H([Uploaded artifact])
+                F --> H
+            """
+        ),
+        md.paragraph(
+            """The renderer has three outputs: the job summary GitHub renders inline, a
+            Markdown artifact you can download, and a JSON result for downstream jobs."""
+        ),
+        md.mermaid(
+            """
+            pie showData title Check outcomes
+                "Passed" : %d
+                "Warnings" : %d
+                "Failed" : %d
+            """
+            % (result["passed"], result["warnings"], result["failed"])
+        ),
+    )
+
+    # -- 7. Component dashboard -------------------------------------------
+    doc.add(
+        md.heading("6. Component health", 2),
+        md.table(
+            ["Component", "State", "Score", "Trend", "Notes"],
+            [
+                [
+                    f"`{c.name}`",
+                    f"{STATUS_ICONS[c.status]} {c.status.title()}",
+                    f"{c.score:.2f}",
+                    md.bar(c.score, width=12),
+                    c.notes,
+                ]
+                for c in components
+            ],
+            align=["left", "center", "right", "left", "left"],
+        ),
+        md.paragraph(
+            "Inline formatting survives the same path: **bold**, _italic_, `inline code`, "
+            "~~strikethrough~~, and " + str(md.link("links", "https://docs.github.com/actions")) + "."
+        ),
+    )
+
+    # -- 8. Code, diff and math -------------------------------------------
+    doc.add(
+        md.heading("7. How publishing works", 2),
+        md.code_block(
+            '''import os
+from pathlib import Path
+
+markdown = "# Hello from Python\\n"
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+if summary:
+    with Path(summary).open("a", encoding="utf-8") as fh:
+        fh.write(markdown)
+else:
+    Path("report.md").write_text(markdown, encoding="utf-8")''',
+            "python",
+        ),
+        md.paragraph("Appending rather than overwriting keeps whatever earlier steps already wrote:"),
+        md.code_block(
+            """-Path(summary).write_text(markdown, encoding="utf-8")
++with Path(summary).open("a", encoding="utf-8") as fh:
++    fh.write(markdown)""",
+            "diff",
+        ),
+        md.paragraph("Score aggregation, for the record:"),
+        md.math_block(r"\text{pass rate} = \frac{\sum_{i} [\,s_i = \text{pass}\,]}{n} = %.2f" % pass_rate),
+    )
+
+    # -- 9. Escaping demo --------------------------------------------------
+    hostile = 'evil | cell <img src=x onerror=alert(1)> **not bold**'
+    doc.add(
+        md.heading("8. Untrusted input", 2),
+        md.paragraph(
+            "Values go through `markdown.escape()` so pipes cannot break out of a cell "
+            "and inline HTML cannot execute:"
+        ),
+        md.table(["Field", "Raw value rendered as data"], [["input", hostile]]),
+        md.details(
+            "Show what escaping produced",
+            md.code_block(md.escape(hostile), "text"),
+        ),
+    )
+
+    # -- 10. Notes ---------------------------------------------------------
+    doc.add(
+        md.heading("9. Implementation notes", 2),
+        md.details(
+            "Why a job summary instead of annotations?",
+            "\n\n".join(
+                [
+                    md.paragraph(
+                        """Annotations are good for pointing at a single line. A summary is a whole
+                        document, which suits dashboards, test reports, deployment records,
+                        infrastructure validation, security findings and benchmark results."""
+                    ),
+                    md.bullet_list(
+                        [
+                            "One file per step; GitHub concatenates them per job.",
+                            "Markdown is GitHub-flavoured — tables, alerts, task lists, Mermaid.",
+                            "Truncated at 1 MiB, so paginate or link out for large data.",
+                            "`<details>` keeps long output collapsed by default.",
+                        ]
+                    ),
+                ]
+            ),
+            open=True,
+        ),
+    )
+
+    # -- 11. Machine-readable payload -------------------------------------
+    doc.add(
+        md.heading("10. Machine-readable result", 2),
+        md.paragraph("The same run is written to `report-result.json` for downstream jobs:"),
+        md.json_block(result),
+    )
+
+    # -- 12. Footer --------------------------------------------------------
+    doc.add(
+        md.rule(),
+        md.heading("11. Conclusion", 2),
+        md.blockquote(
+            f"{overall_icon} **{result['status']}** — "
+            "Python → Markdown → `$GITHUB_STEP_SUMMARY` → rendered report."
+        ),
+        md.paragraph(
+            "The renderer is data-driven"
+            + str(md.footnote_ref("gfm"))
+            + ", so swapping in real results changes no workflow YAML."
+        ),
+        md.paragraph(
+            f"_Generated by `src/report.py` · {now.strftime('%Y-%m-%d %H:%M:%S UTC')}_"
+        ),
+        md.footnotes(
+            {
+                "gfm": "Rendered as GitHub-flavoured Markdown; see "
+                "https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary",
+            }
+        ),
+    )
+
+    return doc.render()
+
+
+def write_summary(report: str, path: str | os.PathLike[str]) -> bool:
+    """Append the report to the job summary file, guarding the size limit."""
+    payload = report.encode("utf-8")
+    if len(payload) > SUMMARY_LIMIT_BYTES:
+        print(
+            f"::warning::report is {len(payload)} bytes, above the "
+            f"{SUMMARY_LIMIT_BYTES} byte job summary limit; truncating",
+            file=sys.stderr,
+        )
+        payload = payload[:SUMMARY_LIMIT_BYTES]
+    with Path(path).open("ab") as fh:
+        fh.write(payload)
+    return True
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--markdown", type=Path, default=Path("report.md"), help="local Markdown copy")
+    parser.add_argument("--json", type=Path, default=Path("report-result.json"), help="machine-readable result")
+    parser.add_argument("--no-summary", action="store_true", help="skip writing $GITHUB_STEP_SUMMARY")
+    parser.add_argument("--stdout", action="store_true", help="also print the report")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    data = collect()
+    report = build_report(data)
+    result = summarise(data)
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path and not args.no_summary:
+        write_summary(report, summary_path)
+        print(f"Job summary appended to {summary_path}")
+    else:
+        print("GITHUB_STEP_SUMMARY not set; writing local files only")
+
+    args.markdown.write_text(report, encoding="utf-8")
+    print(f"Markdown report written to {args.markdown}")
+
+    args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(f"Result payload written to {args.json}")
+
+    if args.stdout:
+        print(report)
+
+    # Surface the headline outcome as a step output when running in Actions.
+    if output_path := os.environ.get("GITHUB_OUTPUT"):
+        with Path(output_path).open("a", encoding="utf-8") as fh:
+            fh.write(f"status={result['status']}\n")
+            fh.write(f"passed={result['passed']}\n")
+            fh.write(f"failed={result['failed']}\n")
+
+    return 1 if result["failed"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
